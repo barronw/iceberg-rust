@@ -23,10 +23,12 @@ use std::sync::Arc;
 
 use _serde::SnapshotV2;
 use chrono::{DateTime, Utc};
+use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use typed_builder::TypedBuilder;
 
 use super::table_metadata::SnapshotLog;
+use super::{DataContentType, DataFile, PartitionSpecRef};
 use crate::error::{timestamp_ms_to_utc, Result};
 use crate::io::FileIO;
 use crate::spec::{ManifestList, SchemaId, SchemaRef, StructType, TableMetadata};
@@ -34,6 +36,31 @@ use crate::{Error, ErrorKind};
 
 /// The ref name of the main branch of the table.
 pub const MAIN_BRANCH: &str = "main";
+
+const ADDED_DATA_FILES: &str = "added-data-files";
+const ADDED_DELETE_FILES: &str = "added-delete-files";
+const ADDED_EQUALITY_DELETES: &str = "added-equality-deletes";
+const ADDED_FILE_SIZE: &str = "added-files-size";
+const ADDED_POSITION_DELETES: &str = "added-position-deletes";
+const ADDED_POSITION_DELETE_FILES: &str = "added-position-delete-files";
+const ADDED_RECORDS: &str = "added-records";
+const DELETED_DATA_FILES: &str = "deleted-data-files";
+const DELETED_RECORDS: &str = "deleted-records";
+const ADDED_EQUALITY_DELETE_FILES: &str = "added-equality-delete-files";
+const REMOVED_DELETE_FILES: &str = "removed-delete-files";
+const REMOVED_EQUALITY_DELETES: &str = "removed-equality-deletes";
+const REMOVED_EQUALITY_DELETE_FILES: &str = "removed-equality-delete-files";
+const REMOVED_FILE_SIZE: &str = "removed-files-size";
+const REMOVED_POSITION_DELETES: &str = "removed-position-deletes";
+const REMOVED_POSITION_DELETE_FILES: &str = "removed-position-delete-files";
+const TOTAL_EQUALITY_DELETES: &str = "total-equality-deletes";
+const TOTAL_POSITION_DELETES: &str = "total-position-deletes";
+const TOTAL_DATA_FILES: &str = "total-data-files";
+const TOTAL_DELETE_FILES: &str = "total-delete-files";
+const TOTAL_RECORDS: &str = "total-records";
+const TOTAL_FILE_SIZE: &str = "total-files-size";
+const CHANGED_PARTITION_COUNT_PROP: &str = "changed-partition-count";
+const CHANGED_PARTITION_PREFIX: &str = "partitions.";
 
 /// Reference to [`Snapshot`].
 pub type SnapshotRef = Arc<Snapshot>;
@@ -211,6 +238,300 @@ impl Snapshot {
             snapshot_id: self.snapshot_id,
         }
     }
+}
+
+#[derive(Default)]
+pub(crate) struct SnapshotSummaryCollector {
+    metrics: UpdateMetrics,
+    partition_metrics: HashMap<String, UpdateMetrics>,
+    max_changed_partitions_for_summaries: u64,
+}
+
+impl SnapshotSummaryCollector {
+    pub fn set_partition_summary_limit(&mut self, limit: u64) {
+        self.max_changed_partitions_for_summaries = limit;
+    }
+
+    pub fn add_file(
+        &mut self,
+        data_file: &DataFile,
+        schema: SchemaRef,
+        partition_spec: PartitionSpecRef,
+    ) {
+        self.metrics.add_file(data_file);
+        if data_file.partition.fields().len() > 0 {
+            self.update_partition_metrics(schema, partition_spec, data_file, true);
+        }
+    }
+
+    pub fn remove_file(
+        &mut self,
+        data_file: &DataFile,
+        schema: SchemaRef,
+        partition_spec: PartitionSpecRef,
+    ) {
+        self.metrics.remove_file(data_file);
+        if data_file.partition.fields().len() > 0 {
+            self.update_partition_metrics(schema, partition_spec, data_file, false);
+        }
+    }
+
+    pub fn update_partition_metrics(
+        &mut self,
+        schema: SchemaRef,
+        partition_spec: PartitionSpecRef,
+        data_file: &DataFile,
+        is_add_file: bool,
+    ) {
+        let partition_path = partition_spec.partition_to_path(&data_file.partition, schema);
+        let metrics = self
+            .partition_metrics
+            .entry(partition_path)
+            .or_insert_with(|| UpdateMetrics::default());
+        if is_add_file {
+            metrics.add_file(data_file);
+        } else {
+            metrics.remove_file(data_file);
+        }
+    }
+
+    pub fn build(&self) -> HashMap<String, String> {
+        let mut properties = self.metrics.to_map();
+        let changed_partitions_count = self.partition_metrics.len() as u64;
+        set_if_positive(
+            &mut properties,
+            changed_partitions_count,
+            CHANGED_PARTITION_COUNT_PROP,
+        );
+        if changed_partitions_count <= self.max_changed_partitions_for_summaries {
+            for (partition_path, update_metrics_partition) in &self.partition_metrics {
+                let property_key = format!("{CHANGED_PARTITION_PREFIX}{partition_path}");
+                let partition_summary = update_metrics_partition
+                    .to_map()
+                    .into_iter()
+                    .map(|(property, value)| format!("{property}={value}"))
+                    .join(",");
+                if !partition_summary.is_empty() {
+                    properties.insert(property_key, partition_summary);
+                }
+            }
+        }
+        properties
+    }
+}
+
+#[derive(Debug, Default)]
+struct UpdateMetrics {
+    added_file_size: u64,
+    removed_file_size: u64,
+    added_data_files: u64,
+    removed_data_files: u64,
+    added_eq_delete_files: u64,
+    removed_eq_delete_files: u64,
+    added_pos_delete_files: u64,
+    removed_pos_delete_files: u64,
+    added_delete_files: u64,
+    removed_delete_files: u64,
+    added_records: u64,
+    deleted_records: u64,
+    added_pos_deletes: u64,
+    removed_pos_deletes: u64,
+    added_eq_deletes: u64,
+    removed_eq_deletes: u64,
+}
+
+impl UpdateMetrics {
+    fn add_file(&mut self, data_file: &DataFile) {
+        self.added_file_size += data_file.file_size_in_bytes;
+        match data_file.content_type() {
+            DataContentType::Data => {
+                self.added_data_files += 1;
+                self.added_records += data_file.record_count;
+            }
+            DataContentType::PositionDeletes => {
+                self.added_delete_files += 1;
+                self.added_pos_delete_files += 1;
+                self.added_pos_deletes += data_file.record_count;
+            }
+            DataContentType::EqualityDeletes => {
+                self.added_delete_files += 1;
+                self.added_eq_delete_files += 1;
+                self.added_eq_deletes += data_file.record_count;
+            }
+        }
+    }
+
+    fn remove_file(&mut self, data_file: &DataFile) {
+        self.removed_file_size += data_file.file_size_in_bytes;
+        match data_file.content_type() {
+            DataContentType::Data => {
+                self.removed_data_files += 1;
+                self.deleted_records += data_file.record_count;
+            }
+            DataContentType::PositionDeletes => {
+                self.removed_delete_files += 1;
+                self.removed_pos_delete_files += 1;
+                self.removed_pos_deletes += data_file.record_count;
+            }
+            DataContentType::EqualityDeletes => {
+                self.removed_delete_files += 1;
+                self.removed_eq_delete_files += 1;
+                self.removed_eq_deletes += data_file.record_count;
+            }
+        }
+    }
+
+    fn to_map(&self) -> HashMap<String, String> {
+        let mut properties = HashMap::new();
+        set_if_positive(&mut properties, self.added_file_size, ADDED_FILE_SIZE);
+        set_if_positive(&mut properties, self.removed_file_size, REMOVED_FILE_SIZE);
+        set_if_positive(&mut properties, self.added_data_files, ADDED_DATA_FILES);
+        set_if_positive(&mut properties, self.removed_data_files, DELETED_DATA_FILES);
+        set_if_positive(
+            &mut properties,
+            self.added_eq_delete_files,
+            ADDED_EQUALITY_DELETE_FILES,
+        );
+        set_if_positive(
+            &mut properties,
+            self.removed_eq_delete_files,
+            REMOVED_EQUALITY_DELETE_FILES,
+        );
+        set_if_positive(
+            &mut properties,
+            self.added_pos_delete_files,
+            ADDED_POSITION_DELETE_FILES,
+        );
+        set_if_positive(
+            &mut properties,
+            self.removed_pos_delete_files,
+            REMOVED_POSITION_DELETE_FILES,
+        );
+        set_if_positive(&mut properties, self.added_delete_files, ADDED_DELETE_FILES);
+        set_if_positive(
+            &mut properties,
+            self.removed_delete_files,
+            REMOVED_DELETE_FILES,
+        );
+        set_if_positive(&mut properties, self.added_records, ADDED_RECORDS);
+        set_if_positive(&mut properties, self.deleted_records, DELETED_RECORDS);
+        set_if_positive(
+            &mut properties,
+            self.added_pos_deletes,
+            ADDED_POSITION_DELETES,
+        );
+        set_if_positive(
+            &mut properties,
+            self.removed_pos_deletes,
+            REMOVED_POSITION_DELETES,
+        );
+        set_if_positive(
+            &mut properties,
+            self.added_eq_deletes,
+            ADDED_EQUALITY_DELETES,
+        );
+        set_if_positive(
+            &mut properties,
+            self.removed_eq_deletes,
+            REMOVED_EQUALITY_DELETES,
+        );
+        properties
+    }
+}
+
+fn set_if_positive(properties: &mut HashMap<String, String>, value: u64, property_name: &str) {
+    if value > 0 {
+        properties.insert(property_name.to_string(), value.to_string());
+    }
+}
+
+pub(crate) fn update_snapshot_summaries(
+    summary: Summary,
+    previous_summary: Option<&Summary>,
+    truncate_full_table: bool,
+) -> Summary {
+    let mut summary = if previous_summary.is_some() && truncate_full_table {
+        todo!()
+    } else {
+        summary
+    };
+    update_totals(
+        &mut summary,
+        previous_summary,
+        TOTAL_DATA_FILES,
+        ADDED_DATA_FILES,
+        DELETED_DATA_FILES,
+    );
+    update_totals(
+        &mut summary,
+        previous_summary,
+        TOTAL_DELETE_FILES,
+        ADDED_DELETE_FILES,
+        REMOVED_DELETE_FILES,
+    );
+    update_totals(
+        &mut summary,
+        previous_summary,
+        TOTAL_RECORDS,
+        ADDED_RECORDS,
+        DELETED_RECORDS,
+    );
+    update_totals(
+        &mut summary,
+        previous_summary,
+        TOTAL_FILE_SIZE,
+        ADDED_FILE_SIZE,
+        REMOVED_FILE_SIZE,
+    );
+    update_totals(
+        &mut summary,
+        previous_summary,
+        TOTAL_POSITION_DELETES,
+        ADDED_POSITION_DELETES,
+        REMOVED_POSITION_DELETES,
+    );
+    update_totals(
+        &mut summary,
+        previous_summary,
+        TOTAL_EQUALITY_DELETES,
+        TOTAL_EQUALITY_DELETES,
+        REMOVED_EQUALITY_DELETES,
+    );
+    summary
+}
+
+fn update_totals(
+    summary: &mut Summary,
+    previous_summary: Option<&Summary>,
+    total_property: &str,
+    added_property: &str,
+    removed_property: &str,
+) {
+    let previous_total = previous_summary.map_or(0, |previous_summary| {
+        previous_summary
+            .additional_properties
+            .get(total_property)
+            .map_or(0, |value| value.parse::<u64>().unwrap())
+    });
+
+    let mut new_total = previous_total;
+    if let Some(value) = summary
+        .additional_properties
+        .get(added_property)
+        .map(|value| value.parse::<u64>().unwrap())
+    {
+        new_total += value;
+    }
+    if let Some(value) = summary
+        .additional_properties
+        .get(removed_property)
+        .map(|value| value.parse::<u64>().unwrap())
+    {
+        new_total -= value;
+    }
+    summary
+        .additional_properties
+        .insert(total_property.to_string(), new_total.to_string());
 }
 
 pub(super) mod _serde {

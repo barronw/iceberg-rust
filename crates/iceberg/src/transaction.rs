@@ -28,10 +28,11 @@ use uuid::Uuid;
 use crate::error::Result;
 use crate::io::OutputFile;
 use crate::spec::{
-    DataFile, DataFileFormat, FormatVersion, Manifest, ManifestEntry, ManifestFile,
-    ManifestListWriter, ManifestMetadata, ManifestWriter, NullOrder, Operation, Snapshot,
-    SnapshotReference, SnapshotRetention, SortDirection, SortField, SortOrder, Struct, StructType,
-    Summary, Transform, MAIN_BRANCH,
+    update_snapshot_summaries, DataFile, DataFileFormat, FormatVersion, Manifest, ManifestEntry,
+    ManifestFile, ManifestListWriter, ManifestMetadata, ManifestWriter, NullOrder, Operation,
+    Snapshot, SnapshotReference, SnapshotRetention, SnapshotSummaryCollector, SortDirection,
+    SortField, SortOrder, Struct, StructType, Summary, Transform, MAIN_BRANCH,
+    PROPERTY_WRITE_PARTITION_SUMMARY_LIMIT, PROPERTY_WRITE_PARTITION_SUMMARY_LIMIT_DEFAULT,
 };
 use crate::table::Table;
 use crate::TableUpdate::UpgradeFormatVersion;
@@ -137,9 +138,15 @@ impl<'a> Transaction<'a> {
         key_metadata: Vec<u8>,
     ) -> Result<FastAppendAction<'a>> {
         let snapshot_id = self.generate_unique_snapshot_id();
+        let parent_snapshot_id = self
+            .table
+            .metadata_ref()
+            .current_snapshot()
+            .map(|snapshot| snapshot.snapshot_id());
         FastAppendAction::new(
             self,
             snapshot_id,
+            parent_snapshot_id,
             commit_uuid.unwrap_or_else(Uuid::now_v7),
             key_metadata,
             HashMap::new(),
@@ -182,6 +189,7 @@ impl<'a> FastAppendAction<'a> {
     pub(crate) fn new(
         tx: Transaction<'a>,
         snapshot_id: i64,
+        parent_snapshot_id: Option<i64>,
         commit_uuid: Uuid,
         key_metadata: Vec<u8>,
         snapshot_properties: HashMap<String, String>,
@@ -190,6 +198,7 @@ impl<'a> FastAppendAction<'a> {
             snapshot_produce_action: SnapshotProduceAction::new(
                 tx,
                 snapshot_id,
+                parent_snapshot_id,
                 key_metadata,
                 commit_uuid,
                 snapshot_properties,
@@ -280,6 +289,7 @@ trait ManifestProcess: Send + Sync {
 struct SnapshotProduceAction<'a> {
     tx: Transaction<'a>,
     snapshot_id: i64,
+    parent_snapshot_id: Option<i64>,
     key_metadata: Vec<u8>,
     commit_uuid: Uuid,
     snapshot_properties: HashMap<String, String>,
@@ -294,6 +304,7 @@ impl<'a> SnapshotProduceAction<'a> {
     pub(crate) fn new(
         tx: Transaction<'a>,
         snapshot_id: i64,
+        parent_snapshot_id: Option<i64>,
         key_metadata: Vec<u8>,
         commit_uuid: Uuid,
         snapshot_properties: HashMap<String, String>,
@@ -301,6 +312,7 @@ impl<'a> SnapshotProduceAction<'a> {
         Ok(Self {
             tx,
             snapshot_id,
+            parent_snapshot_id,
             commit_uuid,
             snapshot_properties,
             added_data_files: vec![],
@@ -433,13 +445,51 @@ impl<'a> SnapshotProduceAction<'a> {
         Ok(manifest_files)
     }
 
-    // # TODO
-    // Fulfill this function
     fn summary<OP: SnapshotProduceOperation>(&self, snapshot_produce_operation: &OP) -> Summary {
-        Summary {
-            operation: snapshot_produce_operation.operation(),
-            additional_properties: self.snapshot_properties.clone(),
+        let mut summary_collector = SnapshotSummaryCollector::default();
+        let table_metadata = self.tx.table.metadata_ref();
+        let partition_summary_limit = if let Some(limit) = table_metadata
+            .properties()
+            .get(PROPERTY_WRITE_PARTITION_SUMMARY_LIMIT)
+        {
+            if let Ok(limit) = limit.parse::<u64>() {
+                limit
+            } else {
+                PROPERTY_WRITE_PARTITION_SUMMARY_LIMIT_DEFAULT
+            }
+        } else {
+            PROPERTY_WRITE_PARTITION_SUMMARY_LIMIT_DEFAULT
+        };
+        summary_collector.set_partition_summary_limit(partition_summary_limit);
+
+        for added_data_file in &self.added_data_files {
+            summary_collector.add_file(
+                added_data_file,
+                table_metadata.current_schema().clone(),
+                table_metadata.default_partition_spec().clone(),
+            );
         }
+
+        // TODO: Support delete entries.
+
+        let previous_snapshot = self.parent_snapshot_id.map(|id| {
+            table_metadata
+                .snapshot_by_id(id)
+                .expect("Failed to find parent snapshot by ID.")
+        });
+
+        let mut additional_properties = summary_collector.build();
+        additional_properties.extend(self.snapshot_properties.clone());
+
+        let summary = Summary {
+            operation: snapshot_produce_operation.operation(),
+            additional_properties,
+        };
+        update_snapshot_summaries(
+            summary,
+            previous_snapshot.map(|snapshot| snapshot.summary()),
+            snapshot_produce_operation.operation() == Operation::Overwrite,
+        )
     }
 
     fn generate_manifest_list_file_path(&self, attempt: i64) -> String {
